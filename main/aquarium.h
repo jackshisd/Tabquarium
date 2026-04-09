@@ -81,7 +81,6 @@ typedef struct {
     int size;
     uint16_t species_index;
     int length_tenths;
-    int hunger;
     int happiness;
     uint16_t name_index;
     bool alive;
@@ -94,6 +93,9 @@ typedef struct {
     int x;
     int y;
     int lifetime_frames;
+    uint16_t consume_frames_remaining;
+    uint8_t size;
+    bool touched;
     bool active;
 } food_t;
 
@@ -146,10 +148,14 @@ bool aquarium_add_fish_with_species(uint16_t species_index, int length_tenths);
 bool aquarium_remove_fish(int index);
 bool aquarium_add_decoration(decor_kind_t kind);
 int aquarium_get_alive_count(void);
+int aquarium_consume_offline_death_count(void);
+bool aquarium_consume_startup_overlay(char *out_message, size_t out_message_size);
+void aquarium_flash_led_for_ms(uint32_t duration_ms);
 void aquarium_load_state(void);
 void aquarium_save_state(void);
 const char *aquarium_decor_name(decor_kind_t kind);
 decor_kind_t aquarium_random_decor_kind(void);
+bool aquarium_is_decor_owned(decor_kind_t kind);
 bool aquarium_is_decor_visible(decor_kind_t kind);
 bool aquarium_toggle_decor_visibility(decor_kind_t kind);
 

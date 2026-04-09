@@ -15,7 +15,17 @@ static const char *TAG = "DISPLAY";
 #define SSD1306_I2C_ADDR 0x3C
 #define SSD1306_I2C_PORT I2C_NUM_0
 
+#if CONFIG_IDF_TARGET_ESP32C3
+#define SSD1306_SDA_GPIO GPIO_NUM_5
+#define SSD1306_SCL_GPIO GPIO_NUM_6
+#else
+#define SSD1306_SDA_GPIO GPIO_NUM_22
+#define SSD1306_SCL_GPIO GPIO_NUM_23
+#endif
+
 static uint8_t display_buffer[1024];
+static uint8_t decor_base_buffer[1024];
+static uint8_t decor_mask_buffer[1024];
 
 static const uint8_t font5x7[][5] = {
     {0x00,0x00,0x00,0x00,0x00}, /* space */
@@ -163,6 +173,7 @@ static int font_index(char c)
 }
 
 static void display_set_pixel(int x, int y, bool on);
+static void display_draw_decoration(decor_kind_t kind, int x, int y);
 
 static void display_draw_text(int x, int y, const char *text)
 {
@@ -237,6 +248,75 @@ static void display_set_pixel(int x, int y, bool on)
         display_buffer[byte_index] |= (1 << bit);
     } else {
         display_buffer[byte_index] &= ~(1 << bit);
+    }
+}
+
+static bool display_get_pixel_from_buffer(const uint8_t *buffer, int x, int y)
+{
+    if (x < 0 || x >= SCREEN_WIDTH || y < 0 || y >= SCREEN_HEIGHT) {
+        return false;
+    }
+
+    int byte_index = (y / 8) * SCREEN_WIDTH + x;
+    int bit = y % 8;
+    return (buffer[byte_index] & (1 << bit)) != 0;
+}
+
+static void display_set_pixel_in_buffer(uint8_t *buffer, int x, int y)
+{
+    if (x < 0 || x >= SCREEN_WIDTH || y < 0 || y >= SCREEN_HEIGHT) {
+        return;
+    }
+
+    int byte_index = (y / 8) * SCREEN_WIDTH + x;
+    int bit = y % 8;
+    buffer[byte_index] |= (1 << bit);
+}
+
+static void display_draw_decoration_bottom_aligned(decor_kind_t kind, int x, int y)
+{
+    memcpy(decor_base_buffer, display_buffer, sizeof(display_buffer));
+    memset(display_buffer, 0, sizeof(display_buffer));
+
+    display_draw_decoration(kind, x, y);
+
+    int bottom_y = -1;
+    for (int scan_y = SCREEN_HEIGHT - 1; scan_y >= 0; scan_y--) {
+        bool found = false;
+        for (int scan_x = 0; scan_x < SCREEN_WIDTH; scan_x++) {
+            if (display_get_pixel_from_buffer(display_buffer, scan_x, scan_y)) {
+                found = true;
+                break;
+            }
+        }
+
+        if (found) {
+            bottom_y = scan_y;
+            break;
+        }
+    }
+
+    memset(decor_mask_buffer, 0, sizeof(decor_mask_buffer));
+    if (bottom_y >= 0) {
+        int shift_y = (SCREEN_HEIGHT - 1) - bottom_y;
+        for (int scan_y = 0; scan_y < SCREEN_HEIGHT; scan_y++) {
+            for (int scan_x = 0; scan_x < SCREEN_WIDTH; scan_x++) {
+                if (!display_get_pixel_from_buffer(display_buffer, scan_x, scan_y)) {
+                    continue;
+                }
+
+                display_set_pixel_in_buffer(decor_mask_buffer, scan_x, scan_y + shift_y);
+            }
+        }
+    }
+
+    memcpy(display_buffer, decor_base_buffer, sizeof(display_buffer));
+    for (int scan_y = 0; scan_y < SCREEN_HEIGHT; scan_y++) {
+        for (int scan_x = 0; scan_x < SCREEN_WIDTH; scan_x++) {
+            if (display_get_pixel_from_buffer(decor_mask_buffer, scan_x, scan_y)) {
+                display_set_pixel(scan_x, scan_y, true);
+            }
+        }
     }
 }
 
@@ -343,15 +423,7 @@ static int collect_owned_decor_kinds(decor_kind_t *out, int max_count)
 #else
     int count = 0;
     for (int kind = 0; kind < DECOR_KIND_COUNT && count < max_count; kind++) {
-        bool owned = false;
-        for (int i = 0; i < MAX_DECOR; i++) {
-            if (decor_list[i].active && decor_list[i].kind == (decor_kind_t)kind) {
-                owned = true;
-                break;
-            }
-        }
-
-        if (owned) {
+        if (aquarium_is_decor_owned((decor_kind_t)kind)) {
             out[count++] = (decor_kind_t)kind;
         }
     }
@@ -375,17 +447,22 @@ static void display_draw_circle(int x, int y, int radius, bool fill)
 
 static void display_draw_fish(int x, int y, int size, bool facing_right)
 {
+    int body_half = size / 2;
     display_draw_circle(x, y, size / 2, true);
     display_draw_circle(x + (facing_right ? size / 4 : -size / 4), y, size / 3, true);
 
     if (facing_right) {
-        display_draw_line(x - size, y, x - size - size / 3, y - size / 2);
-        display_draw_line(x - size, y, x - size - size / 3, y + size / 2);
-        display_draw_line(x - size - size / 3, y - size / 2, x - size - size / 3, y + size / 2);
+        int tail_root_x = x - body_half - 1;
+        int tail_tip_x = tail_root_x - (size / 3);
+        display_draw_line(tail_root_x, y, tail_tip_x, y - size / 2);
+        display_draw_line(tail_root_x, y, tail_tip_x, y + size / 2);
+        display_draw_line(tail_tip_x, y - size / 2, tail_tip_x, y + size / 2);
     } else {
-        display_draw_line(x + size, y, x + size + size / 3, y - size / 2);
-        display_draw_line(x + size, y, x + size + size / 3, y + size / 2);
-        display_draw_line(x + size + size / 3, y - size / 2, x + size + size / 3, y + size / 2);
+        int tail_root_x = x + body_half + 1;
+        int tail_tip_x = tail_root_x + (size / 3);
+        display_draw_line(tail_root_x, y, tail_tip_x, y - size / 2);
+        display_draw_line(tail_root_x, y, tail_tip_x, y + size / 2);
+        display_draw_line(tail_tip_x, y - size / 2, tail_tip_x, y + size / 2);
     }
 }
 
@@ -589,7 +666,8 @@ static void display_draw_catfish(int x, int y, int size, bool facing_right)
     int body_len = size + 1;
     int body_h = (size / 2);
     int head_x = facing_right ? (x + body_len / 2) : (x - body_len / 2);
-    int tail_x = facing_right ? (x - body_len / 2 - 3) : (x + body_len / 2 + 3);
+    int tail_root_x = facing_right ? (x - body_len / 2 - 1) : (x + body_len / 2 + 1);
+    int tail_tip_x = tail_root_x + (facing_right ? -2 : 2);
 
     // Bottom-dweller body
     display_draw_line(x - body_len / 2, y - body_h, x + body_len / 2, y - body_h);
@@ -598,8 +676,8 @@ static void display_draw_catfish(int x, int y, int size, bool facing_right)
     display_draw_line(x + body_len / 2, y - body_h, x + body_len / 2, y + body_h);
 
     // Tail
-    display_draw_line(tail_x, y, tail_x + (facing_right ? -3 : 3), y - 2);
-    display_draw_line(tail_x, y, tail_x + (facing_right ? -3 : 3), y + 2);
+    display_draw_line(tail_root_x, y, tail_tip_x, y - 2);
+    display_draw_line(tail_root_x, y, tail_tip_x, y + 2);
 
     // Barbels (whiskers)
     display_draw_line(head_x, y, head_x + (facing_right ? 3 : -3), y - 1);
@@ -1504,7 +1582,7 @@ static void display_draw_decoration(decor_kind_t kind, int x, int y)
             display_draw_castle(x, y - 14);
             break;
         case DECOR_SHIPWRECK:
-            display_draw_shipwreck(x, y - 14);
+            display_draw_shipwreck(x, y - 12);
             break;
         case DECOR_TREASURE_CHEST:
             display_draw_treasure_chest(x, y - 12);
@@ -1698,8 +1776,8 @@ void display_init(void)
 
     i2c_config_t conf = {
         .mode = I2C_MODE_MASTER,
-        .sda_io_num = 22,
-        .scl_io_num = 23,
+        .sda_io_num = SSD1306_SDA_GPIO,
+        .scl_io_num = SSD1306_SCL_GPIO,
         .sda_pullup_en = GPIO_PULLUP_ENABLE,
         .scl_pullup_en = GPIO_PULLUP_ENABLE,
         .master.clk_speed = 100000,
@@ -1824,7 +1902,7 @@ void display_draw_aquarium_screen(int currency, const char *status, bool show_cl
             continue;
         }
 
-        display_draw_decoration(decor_list[i].kind, decor_list[i].x, decor_list[i].y + decor_y_offset);
+        display_draw_decoration_bottom_aligned(decor_list[i].kind, decor_list[i].x, decor_list[i].y + decor_y_offset);
     }
 
     for (int i = 0; i < MAX_BUBBLES; i++) {
@@ -1837,7 +1915,13 @@ void display_draw_aquarium_screen(int currency, const char *status, bool show_cl
 
     for (int i = 0; i < MAX_FOOD; i++) {
         if (food_list[i].active) {
-            display_draw_circle(food_list[i].x, food_list[i].y, 2, true);
+            int radius = food_list[i].size;
+            if (radius < 1) {
+                radius = 1;
+            } else if (radius > 2) {
+                radius = 2;
+            }
+            display_draw_circle(food_list[i].x, food_list[i].y, radius, true);
         }
     }
 
@@ -1848,7 +1932,7 @@ void display_draw_blindbox_screen(int tabs, bool shaking, int shake_speed, const
 {
     display_clear();
 
-    display_draw_text(0, 0, "GACHA");
+    display_draw_text(0, 0, "Tabquarium");
     char tabs_text[24];
     snprintf(tabs_text, sizeof(tabs_text), "TABS %d", tabs);
     int tabs_text_w = ((int)strlen(tabs_text) * 6) - 1;
@@ -1892,7 +1976,7 @@ void display_draw_clock_set_screen(const char *clock_text)
     const int text_w = (int)strlen(text) * 6 * scale;
     const int text_h = 7 * scale;
     int text_x = (SCREEN_WIDTH - text_w) / 2;
-    int text_y = 14;
+    int text_y = 18;
     if (text_x < 0) {
         text_x = 0;
     }

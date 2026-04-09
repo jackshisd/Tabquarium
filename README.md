@@ -1,106 +1,126 @@
-# Tabquarium - ESP32 Aquarium Game
+# Tabquarium - ESP32-C3 Aquarium Game
 
-A simple aquarium game running on ESP32 with SSD1306 OLED display (128x64 monochrome).
+Tabquarium is an ESP-IDF game for an SSD1306 128x64 OLED aquarium with fish collecting, decorations, blindbox rewards, persistent save data, and sleep-aware simulation.
 
-## Hardware Setup
+## Current Platform
 
-### Components
-- ESP32 Development Board
-- SSD1306 OLED Display (128x64) via I2C
-- 2x Pushbuttons for game input
+- Target MCU: ESP32-C3
+- Framework: ESP-IDF v5.4.x
+- Display: SSD1306 (I2C, monochrome 128x64)
 
-### Wiring
-- **SSD1306 Display (I2C)**
-  - VCC → 3.3V
-  - GND → GND
-  - SDA → GPIO 21
-  - SCL → GPIO 22
+## Hardware Wiring (ESP32-C3)
 
-- **Buttons**
-  - Feed Button → GPIO 32 (press to drop food)
-  - Clean Button → GPIO 33 (press to view stats)
+### OLED (SSD1306, I2C)
 
-## Game Features
+- VCC -> 3.3V
+- GND -> GND
+- SDA -> GPIO 21
+- SCL -> GPIO 22
 
-- Multiple fish swimming in the tank
-- Feed fish by pressing the FEED button
-- Fish have hunger and happiness stats
-- Score system (10 points per food eaten)
-- Simple monochrome graphics
-- Real-time game stats
+### Buttons
 
-## Building & Flashing
+- Mode button -> GPIO 21
+- Action button -> GPIO 20
+- Tabs/Reward button -> GPIO 7
+
+### LED
+
+- Hunger/alert LED -> GPIO 10
+
+## Game Controls
+
+- `Mode`: cycles main screens (Blindbox -> Aquarium -> Fish -> Decorations)
+- `Action` on Blindbox: shake/open rewards
+- `Action` in Aquarium: feed fish (drops random top-spawn food pieces)
+- `Tabs` on Blindbox: earn +1 tab with cooldown
+- Clock set mode:
+  - Enter/exit with mode+action hold combo
+  - Action adjusts hour
+  - Mode adjusts minute
+
+## Core Features
+
+- Blindbox rewards with 80% fish / 20% decoration odds
+- Persistent fish, decorations, tabs, clock, and tank hunger state via NVS
+- Decor ownership tracking separate from active visible decor slots
+- Tank-wide hunger system (single tank timer instead of per-fish hunger)
+- Starvation system:
+  - First random fish death when hunger reaches zero
+  - Then one random fish death every 24h while unfed
+- Wake/offline progression using saved unix timestamps
+- Startup overlays:
+  - Save corruption warning
+  - Offline death summary
+  - Dismissed by button press
+- Save schema recovery:
+  - Legacy fish blob migration path before corruption fallback
+- Fish behaviors:
+  - Food targeting with slight randomness
+  - Species movement variants (including snail/crab behavior)
+- Food system:
+  - 2-3 food pieces per feed action
+  - Top spawn, lifetime/consume timers, and touch/consume logic
+- UI/sleep behavior:
+  - Input lockout after wake to avoid accidental presses
+  - Clock-set screen blocks idle sleep
+- LED behavior:
+  - Blinks when tank reaches half-hunger threshold
+  - 2-second solid pulse when a tab reward is earned
+- Rendering polish:
+  - Multiple fish and decor sprite spacing/alignment tweaks
+  - Clock-set display position adjustments
+  - "Tabquarium" branding text in UI
+  - Decor label update: "Oyster Pearl"
+
+## Build and Flash
 
 ### Prerequisites
-- ESP-IDF installed and configured
-- `idf.py` available in PATH
+
+- ESP-IDF installed and exported in shell
+- `idf.py` available
 
 ### Build
+
 ```bash
 idf.py build
 ```
 
-### Flash (UART)
+### Flash
+
 ```bash
 idf.py flash
 ```
 
-### Monitor Serial Output
+### Monitor
+
 ```bash
 idf.py monitor
 ```
 
 ### Full Cycle
+
 ```bash
 idf.py build flash monitor
 ```
 
-## Project Structure
+## Project Layout
 
-```
+```text
 .
-├── CMakeLists.txt          # Project-level CMake config
-├── sdkconfig               # ESP-IDF configuration
+├── CMakeLists.txt
+├── sdkconfig
 ├── main/
-│   ├── CMakeLists.txt      # Component CMake config
-│   ├── aquarium.c          # Game logic (fish, food, scoring)
-│   ├── aquarium.h          # Game structs and declarations
-│   ├── display.c           # SSD1306 driver and rendering
-│   ├── input.c             # Button input handling
-│   └── ui.c                # Main game loop and app entry
+│   ├── aquarium.c
+│   ├── aquarium.h
+│   ├── display.c
+│   ├── gifts.c
+│   ├── input.c
+│   └── ui.c
 └── .github/
-    └── copilot-instructions.md  # Project documentation for Copilot
+    └── copilot-instructions.md
 ```
 
-## Game Controls
+## Notes
 
-| Button | Action |
-|--------|--------|
-| FEED (GPIO 32) | Drop food in the tank |
-| CLEAN (GPIO 33) | Display game stats in serial |
-
-## Development Notes
-
-### Frame Rate
-- Target: ~60 FPS (17ms per frame)
-- Adjustable via delay in `ui.c`
-
-### Display
-- 128x64 pixel monochrome display
-- Vertical pages (8 pixels per row)
-- I2C communication at 100 kHz
-
-### Fish Behavior
-- Random horizontal movement with wrapping
-- Slight vertical drift (bobbing effect)
-- Hunger decreases over time
-- Fish dies if hunger reaches 0
-- Fish gain happiness and reset hunger when eating
-
-### Scalability
-To expand the game:
-- Add shop menu for buying more fish
-- Implement save/load game state
-- Add more fish behaviors (breeding, sleeping)
-- Implement power-ups or bonus items
-- Add sound effects via piezo buzzer
+- Frame cadence targets ~60 FPS (`vTaskDelay(17ms)` cadence in UI loop).
+- Build outputs under `build/` are generated artifacts and not hand-edited.

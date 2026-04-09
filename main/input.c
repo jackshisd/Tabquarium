@@ -5,9 +5,15 @@
 
 static const char *TAG = "INPUT";
 
+#if CONFIG_IDF_TARGET_ESP32C3
+#define BUTTON_MODE GPIO_NUM_21
+#define BUTTON_ACTION GPIO_NUM_20
+#define BUTTON_TABS GPIO_NUM_7
+#else
 #define BUTTON_MODE GPIO_NUM_19
 #define BUTTON_ACTION GPIO_NUM_21
 #define BUTTON_TABS GPIO_NUM_18
+#endif
 
 static int mode_idle_level = 1;
 static int action_idle_level = 1;

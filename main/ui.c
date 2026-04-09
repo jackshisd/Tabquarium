@@ -52,12 +52,15 @@ bool input_tabs_button_down(void);
 gpio_num_t input_mode_button_gpio(void);
 gpio_num_t input_action_button_gpio(void);
 gpio_num_t input_tabs_button_gpio(void);
+bool aquarium_consume_startup_overlay(char *out_message, size_t out_message_size);
+void aquarium_flash_led_for_ms(uint32_t duration_ms);
 
 static const TickType_t long_press_ticks = pdMS_TO_TICKS(700);
 static const TickType_t tab_reward_cooldown_ticks = pdMS_TO_TICKS(2000);
 static const TickType_t prize_overlay_ticks = pdMS_TO_TICKS(2200);
 static const TickType_t tab_overlay_ticks = pdMS_TO_TICKS(1800);
 static const TickType_t idle_sleep_ticks = pdMS_TO_TICKS(30000);
+static const TickType_t wake_input_lockout_ticks = pdMS_TO_TICKS(500);
 static const TickType_t clock_set_toggle_hold_ticks = pdMS_TO_TICKS(3000);
 static const TickType_t clock_set_repeat_start_ticks = pdMS_TO_TICKS(1000);
 static const TickType_t clock_set_repeat_ticks = pdMS_TO_TICKS(120);
@@ -75,6 +78,7 @@ static bool blindbox_pending_gift = false;
 static bool blindbox_gift_awarded = false;
 static char status_line[32];
 static TickType_t status_expire_tick = 0;
+static bool status_persistent = false;
 static button_state_t mode_button = {0};
 static button_state_t action_button = {0};
 static button_state_t tabs_button = {0};
@@ -82,6 +86,7 @@ static TickType_t last_tab_reward_tick = 0;
 static TickType_t prize_expire_tick = 0;
 static TickType_t tab_overlay_expire_tick = 0;
 static TickType_t last_input_tick = 0;
+static TickType_t input_lockout_until_tick = 0;
 static char prize_name_line[32];
 static char prize_desc_line[32];
 static aquarium_submode_t aquarium_submode = AQUARIUM_SUBMODE_NORMAL;
@@ -97,7 +102,7 @@ static void set_status(const char *message);
 
 static bool aquarium_sleep_prevented(void)
 {
-    return aquarium_submode != AQUARIUM_SUBMODE_NORMAL || current_screen == SCREEN_CLOCK_SET;
+    return current_screen == SCREEN_CLOCK_SET || aquarium_submode != AQUARIUM_SUBMODE_NORMAL;
 }
 
 static void update_clock_text(void)
@@ -152,6 +157,12 @@ static void reset_button_states(void)
     mode_button_prev_down = false;
     action_button_prev_down = false;
     tabs_button_prev_down = false;
+}
+
+static void start_input_lockout(TickType_t now)
+{
+    input_lockout_until_tick = now + wake_input_lockout_ticks;
+    reset_button_states();
 }
 
 static void handle_clock_set_adjust_button(button_state_t *button, bool down, TickType_t now, bool adjust_hours)
@@ -231,6 +242,8 @@ static bool configure_deep_sleep_wakeup_ab_only(void)
     gpio_num_t mode_gpio = input_mode_button_gpio();
     gpio_num_t action_gpio = input_action_button_gpio();
 
+#if CONFIG_IDF_TARGET_ESP32
+
     // ESP32 deep sleep wake on GPIO requires RTC-capable pins.
     bool mode_rtc_ok = rtc_gpio_is_valid_gpio(mode_gpio);
     bool action_rtc_ok = rtc_gpio_is_valid_gpio(action_gpio);
@@ -255,6 +268,12 @@ static bool configure_deep_sleep_wakeup_ab_only(void)
     }
 
     return true;
+#else
+    // EXT0/EXT1 wake APIs are not available on all targets (e.g. ESP32-C3).
+    // Returning false triggers the existing light-sleep GPIO fallback below.
+    ESP_LOGW(TAG, "Deep sleep AB wake unsupported on this target (A=%d B=%d)", mode_gpio, action_gpio);
+    return false;
+#endif
 }
 
 static void enter_idle_sleep_if_needed(TickType_t now)
@@ -296,8 +315,9 @@ static void enter_idle_sleep_if_needed(TickType_t now)
     display_power_on();
     esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_GPIO);
 
-    reset_button_states();
-    last_input_tick = xTaskGetTickCount();
+    TickType_t wake_now = xTaskGetTickCount();
+    start_input_lockout(wake_now);
+    last_input_tick = wake_now;
 }
 
 static bool cooldown_elapsed(TickType_t last_tick, TickType_t cooldown)
@@ -311,12 +331,36 @@ static void set_status(const char *message)
     if (message == NULL) {
         status_line[0] = '\0';
         status_expire_tick = 0;
+        status_persistent = false;
         return;
     }
 
     strncpy(status_line, message, sizeof(status_line) - 1);
     status_line[sizeof(status_line) - 1] = '\0';
     status_expire_tick = xTaskGetTickCount() + pdMS_TO_TICKS(1200);
+    status_persistent = false;
+}
+
+static void set_persistent_status(const char *message)
+{
+    if (message == NULL) {
+        status_line[0] = '\0';
+        status_expire_tick = 0;
+        status_persistent = false;
+        return;
+    }
+
+    strncpy(status_line, message, sizeof(status_line) - 1);
+    status_line[sizeof(status_line) - 1] = '\0';
+    status_expire_tick = 0;
+    status_persistent = true;
+}
+
+static void clear_status(void)
+{
+    status_line[0] = '\0';
+    status_expire_tick = 0;
+    status_persistent = false;
 }
 
 static void set_prize_overlay(const char *name, const char *desc)
@@ -376,7 +420,7 @@ static const char *get_status(void)
         return "";
     }
 
-    if (status_expire_tick != 0 && xTaskGetTickCount() > status_expire_tick) {
+    if (!status_persistent && status_expire_tick != 0 && xTaskGetTickCount() > status_expire_tick) {
         status_line[0] = '\0';
         status_expire_tick = 0;
         return "";
@@ -514,15 +558,7 @@ static int collect_owned_decor_kinds(decor_kind_t *out, int max_count)
 #else
     int count = 0;
     for (int kind = 0; kind < DECOR_KIND_COUNT && count < max_count; kind++) {
-        bool owned = false;
-        for (int i = 0; i < MAX_DECOR; i++) {
-            if (decor_list[i].active && decor_list[i].kind == (decor_kind_t)kind) {
-                owned = true;
-                break;
-            }
-        }
-
-        if (owned) {
+        if (aquarium_is_decor_owned((decor_kind_t)kind)) {
             out[count++] = (decor_kind_t)kind;
         }
     }
@@ -562,13 +598,6 @@ static void scroll_decorations(void)
     if (decorations_scroll_offset >= decor_count) {
         decorations_scroll_offset = 0;
     }
-}
-
-static void drop_food_randomly(void)
-{
-    int x = 8 + (rand() % (SCREEN_WIDTH - 16));
-    int y = WATER_TOP;
-    aquarium_drop_food(x, y);
 }
 
 static void apply_gift(const gift_t *gift)
@@ -688,6 +717,7 @@ static void handle_tabs_button(bool down)
             last_tab_reward_tick = xTaskGetTickCount();
             game_state.tabs += tab_reward_amount;
             aquarium_save_state();
+            aquarium_flash_led_for_ms(2000);
             trigger_tab_overlay();
             set_status("TAB +1");
         }
@@ -812,7 +842,6 @@ static void handle_action_button(bool down)
         } else if (current_screen == SCREEN_AQUARIUM) {
             if (!action_button.long_triggered) {
                 aquarium_feedfish();
-                drop_food_randomly();
                 set_status("FEEDING");
             }
         } else if (current_screen == SCREEN_FISH) {
@@ -835,6 +864,30 @@ static bool update_inputs(TickType_t now)
     bool mode_down = input_mode_button_down();
     bool action_down = input_action_button_down();
     bool tabs_down = input_tabs_button_down();
+
+    if (status_persistent && (mode_down || action_down || tabs_down)) {
+        clear_status();
+        mode_button_prev_down = mode_down;
+        action_button_prev_down = action_down;
+        tabs_button_prev_down = tabs_down;
+        return true;
+    }
+
+    if (input_lockout_until_tick != 0 && now < input_lockout_until_tick) {
+        mode_button_prev_down = mode_down;
+        action_button_prev_down = action_down;
+        tabs_button_prev_down = tabs_down;
+        return false;
+    }
+
+    if (input_lockout_until_tick != 0 && now >= input_lockout_until_tick) {
+        input_lockout_until_tick = 0;
+        reset_button_states();
+        mode_button_prev_down = mode_down;
+        action_button_prev_down = action_down;
+        tabs_button_prev_down = tabs_down;
+        return false;
+    }
 
     if (handle_clock_set_toggle_chord(mode_down, action_down, now)) {
         mode_button_prev_down = mode_down;
@@ -959,8 +1012,24 @@ void game_task(void *pvParameter)
     input_init();
     reset_button_states();
     last_input_tick = xTaskGetTickCount();
+    if (wake_cause != ESP_SLEEP_WAKEUP_UNDEFINED) {
+        start_input_lockout(last_input_tick);
+    }
 
-    set_status("BLINDBOX");
+    char startup_overlay[32];
+    if (aquarium_consume_startup_overlay(startup_overlay, sizeof(startup_overlay))) {
+        set_persistent_status(startup_overlay);
+        current_screen = SCREEN_AQUARIUM;
+    } else {
+        int offline_deaths = aquarium_consume_offline_death_count();
+        if (wake_cause != ESP_SLEEP_WAKEUP_UNDEFINED && offline_deaths > 0) {
+            char wake_msg[32];
+            snprintf(wake_msg, sizeof(wake_msg), "%d FISH DIED", offline_deaths);
+            set_status(wake_msg);
+        } else {
+            set_status("BLINDBOX");
+        }
+    }
 
     while (1) {
         TickType_t now = xTaskGetTickCount();
