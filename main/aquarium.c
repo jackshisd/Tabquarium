@@ -3,6 +3,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include <time.h>
+#include <sys/time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -23,27 +24,38 @@ static const char *NVS_KEY_DECOR_OWNED = "decor_owned";
 static const char *NVS_KEY_LAST_UNIX = "last_unix";
 static const char *NVS_KEY_TANK_HUNGER = "tank_hunger";
 static const char *NVS_KEY_SAVE_VERSION = "save_version";
+static const char *NVS_KEY_WEATHER_SEED = "weather_seed";
 static const int save_schema_version_current = 2;
 
 // Dev toggle: set false for normal persistent gameplay.
 static const bool dev_wipe_on_boot = false;
 static const bool dev_spawn_snail_and_crab = false;
 static const bool dev_spawn_showcase_fish = false;
+static const bool always_raining = false;
+static const bool always_thunder = true;
 
 static const int default_fish_capacity = MAX_FISH_CAPACITY;
 static const int default_tabs = 100;
 static const int hunger_full_seconds = 7 * 24 * 60 * 60;
 static const int starvation_death_interval_seconds = 24 * 60 * 60;
 static const int frames_per_hunger_tick = 60;
-static const int food_lifetime_min_seconds = 12;
-static const int food_lifetime_max_seconds = 12;
+static const int food_lifetime_min_seconds = 10;
+static const int food_lifetime_max_seconds = 10;
 static const int food_consume_min_seconds = 2;
 static const int food_consume_max_seconds = 3;
 static const int food_consume_ms = 500;
 static const int frame_duration_ms = 17;
 static const int bubble_spawn_chance_per_frame = 180;
 static const int slime_lifetime_frames = 90;
+static const int sleep_z_lifetime_frames = 72;
 static const int min_visual_fish_size = 2;
+#define WEATHER_SEED_DURATION_SECONDS (60 * 60)
+#define RAIN_DURATION_SECONDS ((WEATHER_SEED_DURATION_SECONDS * 15) / 100)
+#define SUN_RAYS_DURATION_SECONDS (((WEATHER_SEED_DURATION_SECONDS - RAIN_DURATION_SECONDS) * 30) / 100)
+#define MIN_RAIN_CHUNKS 3
+#define MAX_RAIN_CHUNKS 6
+#define MIN_SUN_CHUNKS 3
+#define MAX_SUN_CHUNKS 6
 static const gpio_num_t hunger_led_gpio = GPIO_NUM_10;
 static const char *decor_names[DECOR_KIND_COUNT] = {
     "Pot of Gold",
@@ -107,6 +119,22 @@ static int pending_offline_death_count = 0;
 static bool startup_overlay_pending = false;
 static char startup_overlay_message[32];
 static TickType_t led_flash_until_tick = 0;
+static int sleep_z_spawn_cooldown_by_fish[NUM_FISH];
+static int feeding_target_food_by_fish[NUM_FISH];
+static int feeding_target_rank_by_fish[NUM_FISH];
+
+typedef struct {
+    int64_t start_unix;
+    int32_t rain_chunk_count;
+    int32_t rain_start_seconds[MAX_RAIN_CHUNKS];
+    int32_t rain_duration_seconds[MAX_RAIN_CHUNKS];
+    bool rain_is_thunder[MAX_RAIN_CHUNKS];
+    int32_t sun_chunk_count;
+    int32_t sun_start_seconds[MAX_SUN_CHUNKS];
+    int32_t sun_duration_seconds[MAX_SUN_CHUNKS];
+} weather_seed_t;
+
+static weather_seed_t weather_seed;
 
 typedef struct {
     int x;
@@ -168,6 +196,77 @@ static int count_alive_fish(void);
 
 static void normalize_loaded_fish_sizes(void);
 
+static int64_t get_unix_time_seconds(void);
+static void restore_saved_clock_time(int64_t saved_unix);
+
+static void split_duration_into_chunks(int total_seconds, int chunk_count, int *out)
+{
+    for (int i = 0; i < chunk_count; i++) {
+        out[i] = 1;
+    }
+
+    int remaining = total_seconds - chunk_count;
+    for (int i = 0; i < remaining; i++) {
+        int idx = (int)(esp_random() % chunk_count);
+        out[idx]++;
+    }
+}
+
+static bool intervals_overlap(int32_t start_a, int32_t duration_a, int32_t start_b, int32_t duration_b)
+{
+    int32_t end_a = start_a + duration_a;
+    int32_t end_b = start_b + duration_b;
+    return start_a < end_b && start_b < end_a;
+}
+
+static bool chunk_overlaps_existing(int32_t start, int32_t duration, const int32_t *starts, const int32_t *durations, int count)
+{
+    for (int i = 0; i < count; i++) {
+        if (durations[i] <= 0 || starts[i] < 0) {
+            continue;
+        }
+
+        if (intervals_overlap(start, duration, starts[i], durations[i])) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool place_weather_chunk(int32_t duration_seconds,
+                                const int32_t *rain_starts,
+                                const int32_t *rain_durations,
+                                int rain_count,
+                                const int32_t *sun_starts,
+                                const int32_t *sun_durations,
+                                int sun_count,
+                                int32_t *start_out)
+{
+    int32_t max_start = WEATHER_SEED_DURATION_SECONDS - duration_seconds;
+    if (max_start < 0) {
+        return false;
+    }
+
+    int32_t search_span = max_start + 1;
+    int32_t first_start = (int32_t)(esp_random() % search_span);
+
+    for (int32_t offset = 0; offset < search_span; offset++) {
+        int32_t candidate = (first_start + offset) % search_span;
+        if (chunk_overlaps_existing(candidate, duration_seconds, rain_starts, rain_durations, rain_count)) {
+            continue;
+        }
+        if (chunk_overlaps_existing(candidate, duration_seconds, sun_starts, sun_durations, sun_count)) {
+            continue;
+        }
+
+        *start_out = candidate;
+        return true;
+    }
+
+    return false;
+}
+
 static void set_startup_overlay_message(const char *message)
 {
     if (message == NULL || message[0] == '\0') {
@@ -179,6 +278,284 @@ static void set_startup_overlay_message(const char *message)
     strncpy(startup_overlay_message, message, sizeof(startup_overlay_message) - 1);
     startup_overlay_message[sizeof(startup_overlay_message) - 1] = '\0';
     startup_overlay_pending = true;
+}
+
+static bool get_current_hour(int *hour_out)
+{
+    if (hour_out == NULL) {
+        return false;
+    }
+
+    time_t now = 0;
+    time(&now);
+    if (now <= 0) {
+        return false;
+    }
+
+    struct tm tm_now;
+    if (localtime_r(&now, &tm_now) == NULL) {
+        return false;
+    }
+
+    *hour_out = tm_now.tm_hour;
+    return true;
+}
+
+static bool get_current_day_seed(int *seed_out)
+{
+    if (seed_out == NULL) {
+        return false;
+    }
+
+    time_t now = 0;
+    time(&now);
+    if (now <= 0) {
+        return false;
+    }
+
+    struct tm tm_now;
+    if (localtime_r(&now, &tm_now) == NULL) {
+        return false;
+    }
+
+    *seed_out = (tm_now.tm_year * 366) + tm_now.tm_yday;
+    return true;
+}
+
+bool aquarium_is_daytime(void)
+{
+    int hour = 12;
+    if (!get_current_hour(&hour)) {
+        return true;
+    }
+
+    return hour >= 6 && hour < 20;
+}
+
+static void generate_hourly_weather_seed(int64_t now_unix)
+{
+    int rain_chunks[MAX_RAIN_CHUNKS] = {0};
+    int sun_chunks[MAX_SUN_CHUNKS] = {0};
+
+    memset(&weather_seed, 0, sizeof(weather_seed));
+    weather_seed.start_unix = now_unix;
+
+    weather_seed.rain_chunk_count = MIN_RAIN_CHUNKS + (int)(esp_random() % (MAX_RAIN_CHUNKS - MIN_RAIN_CHUNKS + 1));
+    split_duration_into_chunks(RAIN_DURATION_SECONDS, weather_seed.rain_chunk_count, rain_chunks);
+    for (int i = 0; i < weather_seed.rain_chunk_count; i++) {
+        weather_seed.rain_duration_seconds[i] = rain_chunks[i];
+        if (!place_weather_chunk(rain_chunks[i],
+                                 weather_seed.rain_start_seconds,
+                                 weather_seed.rain_duration_seconds,
+                                 i,
+                                 weather_seed.sun_start_seconds,
+                                 weather_seed.sun_duration_seconds,
+                                 0,
+                                 &weather_seed.rain_start_seconds[i])) {
+            weather_seed.rain_chunk_count = i;
+            break;
+        }
+        weather_seed.rain_is_thunder[i] = always_thunder || ((esp_random() & 1U) == 0);
+    }
+
+    weather_seed.sun_chunk_count = MIN_SUN_CHUNKS + (int)(esp_random() % (MAX_SUN_CHUNKS - MIN_SUN_CHUNKS + 1));
+    split_duration_into_chunks(SUN_RAYS_DURATION_SECONDS, weather_seed.sun_chunk_count, sun_chunks);
+    for (int i = 0; i < weather_seed.sun_chunk_count; i++) {
+        weather_seed.sun_duration_seconds[i] = sun_chunks[i];
+        if (!place_weather_chunk(sun_chunks[i],
+                                 weather_seed.rain_start_seconds,
+                                 weather_seed.rain_duration_seconds,
+                                 weather_seed.rain_chunk_count,
+                                 weather_seed.sun_start_seconds,
+                                 weather_seed.sun_duration_seconds,
+                                 i,
+                                 &weather_seed.sun_start_seconds[i])) {
+            weather_seed.sun_chunk_count = i;
+            break;
+        }
+    }
+}
+
+static void ensure_hourly_weather_seed(void)
+{
+    int64_t now_unix = get_unix_time_seconds();
+    if (now_unix <= 0) {
+        return;
+    }
+
+    if (weather_seed.start_unix <= 0 || (now_unix - weather_seed.start_unix) >= WEATHER_SEED_DURATION_SECONDS) {
+        generate_hourly_weather_seed(now_unix);
+    }
+}
+
+static bool weather_chunks_active(int64_t now_unix, int chunk_count, const int32_t *starts, const int32_t *durations)
+{
+    if (weather_seed.start_unix <= 0 || chunk_count <= 0) {
+        return false;
+    }
+
+    int64_t elapsed = now_unix - weather_seed.start_unix;
+    if (elapsed < 0 || elapsed >= WEATHER_SEED_DURATION_SECONDS) {
+        return false;
+    }
+
+    for (int i = 0; i < chunk_count; i++) {
+        if (durations[i] <= 0 || starts[i] < 0) {
+            continue;
+        }
+        if (elapsed >= starts[i] && elapsed < ((int64_t)starts[i] + durations[i])) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static int weather_active_chunk_index(int64_t now_unix, int chunk_count, const int32_t *starts, const int32_t *durations)
+{
+    if (weather_seed.start_unix <= 0 || chunk_count <= 0) {
+        return -1;
+    }
+
+    int64_t elapsed = now_unix - weather_seed.start_unix;
+    if (elapsed < 0 || elapsed >= WEATHER_SEED_DURATION_SECONDS) {
+        return -1;
+    }
+
+    for (int i = 0; i < chunk_count; i++) {
+        if (durations[i] <= 0 || starts[i] < 0) {
+            continue;
+        }
+        if (elapsed >= starts[i] && elapsed < ((int64_t)starts[i] + durations[i])) {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+static uint32_t thunder_hash_u32(uint32_t value)
+{
+    value ^= value >> 16;
+    value *= 0x7feb352dU;
+    value ^= value >> 15;
+    value *= 0x846ca68bU;
+    value ^= value >> 16;
+    return value;
+}
+
+bool aquarium_is_raining(void)
+{
+    if (always_raining || always_thunder) {
+        return true;
+    }
+
+    ensure_hourly_weather_seed();
+    int64_t now_unix = get_unix_time_seconds();
+    if (now_unix <= 0) {
+        return false;
+    }
+
+    return weather_chunks_active(now_unix, weather_seed.rain_chunk_count, weather_seed.rain_start_seconds, weather_seed.rain_duration_seconds);
+}
+
+bool aquarium_is_thunderstorm(void)
+{
+    ensure_hourly_weather_seed();
+    int64_t now_unix = get_unix_time_seconds();
+    if (now_unix <= 0) {
+        return false;
+    }
+
+    int rain_chunk = weather_active_chunk_index(
+        now_unix, weather_seed.rain_chunk_count, weather_seed.rain_start_seconds, weather_seed.rain_duration_seconds);
+    if (rain_chunk < 0) {
+        return false;
+    }
+
+    return always_thunder || weather_seed.rain_is_thunder[rain_chunk];
+}
+
+bool aquarium_should_flash_thunder(void)
+{
+    if (!aquarium_is_thunderstorm()) {
+        return false;
+    }
+
+    if (always_thunder) {
+        TickType_t now_tick = xTaskGetTickCount();
+        int burst_tick = (int)(now_tick % pdMS_TO_TICKS(3000));
+        if (burst_tick < pdMS_TO_TICKS(140)) {
+            return true;
+        }
+        if (burst_tick >= pdMS_TO_TICKS(260) && burst_tick < pdMS_TO_TICKS(360)) {
+            return true;
+        }
+        if (burst_tick >= pdMS_TO_TICKS(520) && burst_tick < pdMS_TO_TICKS(600)) {
+            return true;
+        }
+        return false;
+    }
+
+    int64_t now_unix = get_unix_time_seconds();
+    if (now_unix <= 0) {
+        return false;
+    }
+
+    int rain_chunk = weather_active_chunk_index(
+        now_unix, weather_seed.rain_chunk_count, weather_seed.rain_start_seconds, weather_seed.rain_duration_seconds);
+    if (rain_chunk < 0) {
+        return false;
+    }
+
+    int64_t elapsed = now_unix - weather_seed.start_unix;
+    int chunk_elapsed_seconds = (int)(elapsed - weather_seed.rain_start_seconds[rain_chunk]);
+    if (chunk_elapsed_seconds < 0) {
+        return false;
+    }
+
+    int minute_in_chunk = chunk_elapsed_seconds / 60;
+    int second_in_minute = chunk_elapsed_seconds % 60;
+    TickType_t now_tick = xTaskGetTickCount();
+    int ms_in_second = (int)((now_tick * portTICK_PERIOD_MS) % 1000);
+
+    for (int strike = 0; strike < 3; strike++) {
+        uint32_t seed = thunder_hash_u32((uint32_t)weather_seed.start_unix ^
+                                         (uint32_t)(rain_chunk * 131 + minute_in_chunk * 17 + strike * 73));
+        int strike_second = (int)(seed % 20U) + (strike * 20);
+        if (strike_second != second_in_minute) {
+            continue;
+        }
+
+        int pattern_offset_ms = ms_in_second % 360;
+        if ((pattern_offset_ms < 55) ||
+            (pattern_offset_ms >= 110 && pattern_offset_ms < 150) ||
+            (pattern_offset_ms >= 210 && pattern_offset_ms < 240)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool aquarium_should_show_sun_rays(void)
+{
+    if (!aquarium_is_daytime() || aquarium_is_raining()) {
+        return false;
+    }
+
+    ensure_hourly_weather_seed();
+    int64_t now_unix = get_unix_time_seconds();
+    if (now_unix <= 0) {
+        return false;
+    }
+
+    return weather_chunks_active(now_unix, weather_seed.sun_chunk_count, weather_seed.sun_start_seconds, weather_seed.sun_duration_seconds);
+}
+
+void aquarium_invalidate_weather_seed(void)
+{
+    memset(&weather_seed, 0, sizeof(weather_seed));
 }
 
 static bool kill_random_alive_fish(void)
@@ -386,12 +763,25 @@ static bool has_active_food(void)
     return false;
 }
 
+static int count_active_food(void)
+{
+    int count = 0;
+    for (int i = 0; i < MAX_FOOD; i++) {
+        if (food_list[i].active) {
+            count++;
+        }
+    }
+    return count;
+}
+
 static int find_food_slot_by_rank(int x, int y, int rank)
 {
     int best_index = -1;
     int second_index = -1;
+    int third_index = -1;
     int best_dist2 = 0;
     int second_dist2 = 0;
+    int third_dist2 = 0;
 
     for (int i = 0; i < MAX_FOOD; i++) {
         if (!food_list[i].active) {
@@ -402,21 +792,52 @@ static int find_food_slot_by_rank(int x, int y, int rank)
         int dy = food_list[i].y - y;
         int dist2 = (dx * dx) + (dy * dy);
         if (best_index < 0 || dist2 < best_dist2) {
+            third_index = second_index;
+            third_dist2 = second_dist2;
             second_index = best_index;
             second_dist2 = best_dist2;
             best_index = i;
             best_dist2 = dist2;
         } else if (second_index < 0 || dist2 < second_dist2) {
+            third_index = second_index;
+            third_dist2 = second_dist2;
             second_index = i;
             second_dist2 = dist2;
+        } else if (third_index < 0 || dist2 < third_dist2) {
+            third_index = i;
+            third_dist2 = dist2;
         }
     }
 
     if (rank == 1 && second_index >= 0) {
         return second_index;
     }
+    if (rank == 2 && third_index >= 0) {
+        return third_index;
+    }
 
     return best_index;
+}
+
+static int choose_food_rank_for_fish(void)
+{
+    int active_food = count_active_food();
+    if (active_food >= 3) {
+        int roll = rand() % 100;
+        if (roll < 20) {
+            return 2;
+        }
+        if (roll < 50) {
+            return 1;
+        }
+        return 0;
+    }
+
+    if (active_food >= 2) {
+        return ((rand() % 100) < 35) ? 1 : 0;
+    }
+
+    return 0;
 }
 
 static int random_food_consume_frames(void)
@@ -436,6 +857,7 @@ food_t food_list[MAX_FOOD];
 decor_t decor_list[MAX_DECOR];
 bubble_t bubble_list[MAX_BUBBLES];
 slime_t slime_list[MAX_SLIME];
+sleep_z_t sleep_z_list[MAX_SLEEP_Z];
 
 static void spawn_snail_slime(int x, int y, int vx, int vy, int size)
 {
@@ -470,6 +892,28 @@ static void spawn_snail_slime(int x, int y, int vx, int vy, int size)
         slime_list[i].lifetime_frames = slime_lifetime_frames;
         return;
     }
+}
+
+static void spawn_sleep_z_particle(int fish_x, int fish_y, bool facing_right)
+{
+    for (int i = 0; i < MAX_SLEEP_Z; i++) {
+        if (sleep_z_list[i].active) {
+            continue;
+        }
+
+        sleep_z_list[i].active = true;
+        sleep_z_list[i].x = fish_x + (facing_right ? -2 : 0);
+        sleep_z_list[i].y = fish_y - 4;
+        sleep_z_list[i].vx = facing_right ? -1 : 1;
+        sleep_z_list[i].lifetime_frames = sleep_z_lifetime_frames;
+        return;
+    }
+}
+
+static void spawn_sleep_z_pair(int fish_x, int fish_y, bool facing_right)
+{
+    // Only spawn a single Z centered above the fish
+    spawn_sleep_z_particle(fish_x, fish_y - 8, facing_right);
 }
 
 static int count_alive_fish(void)
@@ -610,6 +1054,16 @@ static void clear_world(void)
     for (int i = 0; i < MAX_SLIME; i++) {
         memset(&slime_list[i], 0, sizeof(slime_list[i]));
     }
+
+    for (int i = 0; i < MAX_SLEEP_Z; i++) {
+        memset(&sleep_z_list[i], 0, sizeof(sleep_z_list[i]));
+    }
+
+    for (int i = 0; i < NUM_FISH; i++) {
+        sleep_z_spawn_cooldown_by_fish[i] = 0;
+        feeding_target_food_by_fish[i] = -1;
+        feeding_target_rank_by_fish[i] = 0;
+    }
 }
 
 static void clear_fish_and_food(void)
@@ -628,6 +1082,16 @@ static void clear_fish_and_food(void)
 
     for (int i = 0; i < MAX_SLIME; i++) {
         memset(&slime_list[i], 0, sizeof(slime_list[i]));
+    }
+
+    for (int i = 0; i < MAX_SLEEP_Z; i++) {
+        memset(&sleep_z_list[i], 0, sizeof(sleep_z_list[i]));
+    }
+
+    for (int i = 0; i < NUM_FISH; i++) {
+        sleep_z_spawn_cooldown_by_fish[i] = 0;
+        feeding_target_food_by_fish[i] = -1;
+        feeding_target_rank_by_fish[i] = 0;
     }
 }
 
@@ -717,6 +1181,23 @@ static void load_default_state(void)
     tank_hunger_seconds = hunger_full_seconds;
 
     clear_world();
+
+    // First boot starts at 12:00 so the aquarium opens in daytime.
+    struct tm tm_noon = {0};
+    tm_noon.tm_year = 70;
+    tm_noon.tm_mon = 0;
+    tm_noon.tm_mday = 1;
+    tm_noon.tm_hour = 12;
+    tm_noon.tm_isdst = -1;
+
+    time_t noon_time = mktime(&tm_noon);
+    if (noon_time > 0) {
+        struct timeval tv = {
+            .tv_sec = noon_time,
+            .tv_usec = 0,
+        };
+        settimeofday(&tv, NULL);
+    }
 }
 
 static void load_dev_wiped_state(void)
@@ -760,6 +1241,19 @@ static int64_t get_unix_time_seconds(void)
     time_t now = 0;
     time(&now);
     return (now > 0) ? (int64_t)now : 0;
+}
+
+static void restore_saved_clock_time(int64_t saved_unix)
+{
+    if (saved_unix <= 0) {
+        return;
+    }
+
+    struct timeval tv = {
+        .tv_sec = (time_t)saved_unix,
+        .tv_usec = 0,
+    };
+    settimeofday(&tv, NULL);
 }
 
 static int apply_offline_hunger_decay(int64_t elapsed_seconds)
@@ -823,6 +1317,7 @@ void aquarium_load_state(void)
     int64_t last_unix = 0;
     int32_t stored_tank_hunger = hunger_full_seconds;
     int32_t stored_save_version = 0;
+    weather_seed_t stored_weather_seed = {0};
     esp_err_t err_state = nvs_get_blob(handle, NVS_KEY_STATE, &game_state, &state_size);
     esp_err_t err_fish = nvs_get_blob(handle, NVS_KEY_FISH, fish_tank, &fish_size);
     esp_err_t err_decor = nvs_get_blob(handle, NVS_KEY_DECOR, decor_list, &decor_size);
@@ -830,6 +1325,8 @@ void aquarium_load_state(void)
     esp_err_t err_last_unix = nvs_get_i64(handle, NVS_KEY_LAST_UNIX, &last_unix);
     esp_err_t err_tank_hunger = nvs_get_i32(handle, NVS_KEY_TANK_HUNGER, &stored_tank_hunger);
     esp_err_t err_save_version = nvs_get_i32(handle, NVS_KEY_SAVE_VERSION, &stored_save_version);
+    size_t weather_seed_size = sizeof(stored_weather_seed);
+    esp_err_t err_weather_seed = nvs_get_blob(handle, NVS_KEY_WEATHER_SEED, &stored_weather_seed, &weather_seed_size);
     nvs_close(handle);
 
     if (err_state != ESP_OK) {
@@ -844,6 +1341,16 @@ void aquarium_load_state(void)
         tank_hunger_seconds = stored_tank_hunger;
     } else {
         tank_hunger_seconds = hunger_full_seconds;
+    }
+    int64_t now_unix = get_unix_time_seconds();
+    if (now_unix <= 0 && err_last_unix == ESP_OK && last_unix > 0) {
+        restore_saved_clock_time(last_unix);
+        now_unix = get_unix_time_seconds();
+    }
+    if (err_weather_seed == ESP_OK && weather_seed_size == sizeof(stored_weather_seed)) {
+        weather_seed = stored_weather_seed;
+    } else {
+        memset(&weather_seed, 0, sizeof(weather_seed));
     }
 
     clamp_state_values();
@@ -906,9 +1413,9 @@ void aquarium_load_state(void)
     }
 
     if (!save_corrupted && err_last_unix == ESP_OK) {
-        int64_t now_unix = get_unix_time_seconds();
         if (now_unix > last_unix) {
-            int deaths = apply_offline_hunger_decay(now_unix - last_unix);
+            int64_t elapsed_seconds = now_unix - last_unix;
+            int deaths = apply_offline_hunger_decay(elapsed_seconds);
             if (deaths > 0) {
                 pending_offline_death_count += deaths;
                 char death_msg[32];
@@ -933,6 +1440,7 @@ void aquarium_save_state(void)
     nvs_set_blob(handle, NVS_KEY_DECOR_OWNED, decor_owned, sizeof(decor_owned));
     nvs_set_i32(handle, NVS_KEY_TANK_HUNGER, tank_hunger_seconds);
     nvs_set_i32(handle, NVS_KEY_SAVE_VERSION, save_schema_version_current);
+    nvs_set_blob(handle, NVS_KEY_WEATHER_SEED, &weather_seed, sizeof(weather_seed));
 
     int64_t now_unix = get_unix_time_seconds();
     if (now_unix > 0) {
@@ -1121,30 +1629,48 @@ void aquarium_drop_food(int x, int y)
 void aquarium_update(void)
 {
     bool state_changed = false;
+    ensure_hourly_weather_seed();
+    bool is_night = !aquarium_is_daytime();
 
     for (int i = 0; i < NUM_FISH; i++) {
         if (!fish_tank[i].alive) {
             continue;
         }
 
-        if (!fish_tank[i].feeding && has_active_food() &&
-            fish_tank[i].species_index != snail_species_index &&
-            fish_tank[i].species_index != crab_species_index) {
-            fish_tank[i].feeding = true;
-            fish_tank[i].feed_timer = 0;
+        bool is_special_fish = (fish_tank[i].species_index == snail_species_index ||
+                                fish_tank[i].species_index == crab_species_index);
+
+        if (!is_special_fish) {
+            if (is_night) {
+                fish_tank[i].feeding = false;
+                fish_tank[i].feed_timer = 0;
+                feeding_target_food_by_fish[i] = -1;
+            } else if (!fish_tank[i].feeding && has_active_food()) {
+                fish_tank[i].feeding = true;
+                fish_tank[i].feed_timer = 0;
+                feeding_target_rank_by_fish[i] = choose_food_rank_for_fish();
+                feeding_target_food_by_fish[i] =
+                    find_food_slot_by_rank(fish_tank[i].x, fish_tank[i].y, feeding_target_rank_by_fish[i]);
+            }
         }
 
         if (fish_tank[i].feeding) {
-            if (fish_tank[i].species_index == snail_species_index ||
-                fish_tank[i].species_index == crab_species_index) {
+            if (is_special_fish) {
                 fish_tank[i].feeding = false;
                 fish_tank[i].feed_timer = 0;
+                feeding_target_food_by_fish[i] = -1;
             } else {
-                int preferred_rank = ((rand() % 3) == 0) ? 1 : 0;
-                int target_food = find_food_slot_by_rank(fish_tank[i].x, fish_tank[i].y, preferred_rank);
+                int target_food = feeding_target_food_by_fish[i];
+                if (target_food < 0 || target_food >= MAX_FOOD || !food_list[target_food].active) {
+                    feeding_target_rank_by_fish[i] = choose_food_rank_for_fish();
+                    target_food =
+                        find_food_slot_by_rank(fish_tank[i].x, fish_tank[i].y, feeding_target_rank_by_fish[i]);
+                    feeding_target_food_by_fish[i] = target_food;
+                }
                 if (target_food < 0) {
                     fish_tank[i].feeding = false;
                     fish_tank[i].feed_timer = 0;
+                    feeding_target_food_by_fish[i] = -1;
                 } else {
                     int dx = food_list[target_food].x - fish_tank[i].x;
                     int offset_seed = (game_state.time_elapsed + (i * 7)) % 9;
@@ -1288,13 +1814,58 @@ void aquarium_update(void)
             continue;
         }
 
+        // Sleeping state is chosen once at dusk and then held for the whole night.
+        static bool fish_sleeping_tonight[NUM_FISH] = {0};
+        static int last_night_flag = -1;
+        int current_night_flag = is_night ? 1 : 0;
+        if (current_night_flag == 1 && last_night_flag != 1) {
+            // Transitioned from day to night: choose 20% of fish to sleep.
+            for (int k = 0; k < NUM_FISH; k++) {
+                fish_sleeping_tonight[k] = (rand() % 100) < 20;
+            }
+        }
+        last_night_flag = current_night_flag;
+        bool fish_is_sleeping = is_night && !is_special_fish && fish_sleeping_tonight[i];
+        if (fish_is_sleeping) {
+            fish_tank[i].vx = 0;
+            fish_tank[i].vy = 0;
+
+            if (sleep_z_spawn_cooldown_by_fish[i] > 0) {
+                sleep_z_spawn_cooldown_by_fish[i]--;
+            }
+
+            if (sleep_z_spawn_cooldown_by_fish[i] <= 0) {
+                spawn_sleep_z_particle(fish_tank[i].x, fish_tank[i].y, fish_tank[i].facing_right);
+                int sleep_z_spawn_frames = (600 + frame_duration_ms - 1) / frame_duration_ms;
+                sleep_z_spawn_cooldown_by_fish[i] = sleep_z_spawn_frames;
+                if (sleep_z_spawn_cooldown_by_fish[i] <= 0) {
+                    sleep_z_spawn_cooldown_by_fish[i] = 1;
+                }
+            }
+
+            continue;
+        }
+
+        if (is_night && !is_special_fish) {
+            if (sleep_z_spawn_cooldown_by_fish[i] > 0) {
+                sleep_z_spawn_cooldown_by_fish[i]--;
+            }
+        } else {
+            sleep_z_spawn_cooldown_by_fish[i] = 0;
+        }
+
         // Add smooth variability: occasional turns, speed changes, and vertical drift.
-        if (!fish_tank[i].feeding && (game_state.time_elapsed % 8) == 0) {
-            if ((rand() % 100) < 15) {
+        if (!fish_tank[i].feeding && (game_state.time_elapsed % (is_night ? 40 : 8)) == 0) {
+            int turn_chance = is_night ? 7 : 15;
+            int stop_chance = is_night ? 3 : 5;
+            int sideways_chance = is_night ? 4 : 8;
+            int speed_change_chance = is_night ? 6 : 12;
+
+            if ((rand() % 100) < turn_chance) {
                 fish_tank[i].vy += (rand() % 3) - 1;
             }
 
-            if ((rand() % 100) < 5) {
+            if ((rand() % 100) < stop_chance) {
                 fish_tank[i].vy = 0;
             }
 
@@ -1304,17 +1875,33 @@ void aquarium_update(void)
                 fish_tank[i].vy = -2;
             }
 
-            if ((rand() % 100) < 8) {
+            if ((rand() % 100) < sideways_chance) {
                 int speed = 1 + (rand() % 2);
                 fish_tank[i].vx = (fish_tank[i].vx >= 0) ? -speed : speed;
-            } else if ((rand() % 100) < 12) {
+            } else if ((rand() % 100) < speed_change_chance) {
                 int dir = (fish_tank[i].vx >= 0) ? 1 : -1;
                 fish_tank[i].vx = dir * (1 + (rand() % 2));
             }
+
+            if (is_night) {
+                if (fish_tank[i].vx > 1) {
+                    fish_tank[i].vx = 1;
+                } else if (fish_tank[i].vx < -1) {
+                    fish_tank[i].vx = -1;
+                }
+
+                if (fish_tank[i].vy > 1) {
+                    fish_tank[i].vy = 1;
+                } else if (fish_tank[i].vy < -1) {
+                    fish_tank[i].vy = -1;
+                }
+            }
         }
 
-        fish_tank[i].x += fish_tank[i].vx;
-        fish_tank[i].y += fish_tank[i].vy;
+        if ((game_state.time_elapsed % (is_night ? 2 : 1)) == 0) {
+            fish_tank[i].x += fish_tank[i].vx;
+            fish_tank[i].y += fish_tank[i].vy;
+        }
 
         int left_limit = fish_tank[i].size;
         int right_limit = SCREEN_WIDTH - fish_tank[i].size;
@@ -1366,7 +1953,7 @@ void aquarium_update(void)
             continue;
         }
 
-        if (!food_list[i].touched && (game_state.time_elapsed % 2) == 0) {
+        if ((game_state.time_elapsed % 2) == 0) {
             food_list[i].y += 1;
         }
 
@@ -1413,6 +2000,7 @@ void aquarium_update(void)
         fish_tank[eater_index].happiness = 100;
         fish_tank[eater_index].feed_timer = 0;
         fish_tank[eater_index].feeding = has_active_food();
+        feeding_target_food_by_fish[eater_index] = -1;
         food_list[i].active = false;
         state_changed = true;
     }
@@ -1427,6 +2015,7 @@ void aquarium_update(void)
                 fish_tank[i].feeding = false;
                 fish_tank[i].feed_timer = 0;
             }
+            feeding_target_food_by_fish[i] = -1;
         }
     }
 
@@ -1468,6 +2057,26 @@ void aquarium_update(void)
         }
         if (slime_list[i].lifetime_frames == 0) {
             slime_list[i].active = false;
+        }
+    }
+
+    for (int i = 0; i < MAX_SLEEP_Z; i++) {
+        if (!sleep_z_list[i].active) {
+            continue;
+        }
+
+        if (sleep_z_list[i].lifetime_frames > 0) {
+            sleep_z_list[i].lifetime_frames--;
+        }
+
+        if (sleep_z_list[i].lifetime_frames == 0) {
+            sleep_z_list[i].active = false;
+            continue;
+        }
+
+        if ((sleep_z_list[i].lifetime_frames % 6) == 0) {
+            sleep_z_list[i].x += sleep_z_list[i].vx;
+            sleep_z_list[i].y -= 1;
         }
     }
 

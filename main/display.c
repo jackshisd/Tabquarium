@@ -6,6 +6,7 @@
 #include "freertos/FreeRTOS.h"
 #include "driver/i2c.h"
 #include "esp_log.h"
+#include "esp_random.h"
 #include "fish_catalog.h"
 #include "fish_names.h"
 #include "aquarium.h"
@@ -26,6 +27,20 @@ static const char *TAG = "DISPLAY";
 static uint8_t display_buffer[1024];
 static uint8_t decor_base_buffer[1024];
 static uint8_t decor_mask_buffer[1024];
+
+typedef struct {
+    int x;
+    int y;
+    int state;
+    int age;
+    int speed;
+    bool active;
+} rain_drop_t;
+
+static rain_drop_t rain_drops[12];
+static int last_rain_frame = -1;
+static int sun_ray_origin_x = -1;
+static int sun_ray_beam_count = 0;
 
 static const uint8_t font5x7[][5] = {
     {0x00,0x00,0x00,0x00,0x00}, /* space */
@@ -174,6 +189,7 @@ static int font_index(char c)
 
 static void display_set_pixel(int x, int y, bool on);
 static void display_draw_decoration(decor_kind_t kind, int x, int y);
+static void display_draw_dotted_line(int x1, int y1, int x2, int y2);
 
 static void display_draw_text(int x, int y, const char *text)
 {
@@ -226,6 +242,30 @@ static void display_draw_scaled_text(int x, int y, const char *text, int scale)
 
         x += 6 * scale;
     }
+}
+
+static int clamp_int(int value, int min_value, int max_value)
+{
+    if (value < min_value) {
+        return min_value;
+    }
+    if (value > max_value) {
+        return max_value;
+    }
+    return value;
+}
+
+static void display_draw_tiny_sleep_z(int x, int y)
+{
+    // Compact 3x4 "Z" for sleep particles so it reads as a hint, not UI text.
+    display_set_pixel(x, y, true);
+    display_set_pixel(x + 1, y, true);
+    display_set_pixel(x + 2, y, true);
+    display_set_pixel(x + 2, y + 1, true);
+    display_set_pixel(x + 1, y + 2, true);
+    display_set_pixel(x, y + 3, true);
+    display_set_pixel(x + 1, y + 3, true);
+    display_set_pixel(x + 2, y + 3, true);
 }
 
 static void display_draw_number(int x, int y, int value)
@@ -281,19 +321,28 @@ static void display_draw_decoration_bottom_aligned(decor_kind_t kind, int x, int
     display_draw_decoration(kind, x, y);
 
     int bottom_y = -1;
+    int fallback_bottom_y = -1;
     for (int scan_y = SCREEN_HEIGHT - 1; scan_y >= 0; scan_y--) {
-        bool found = false;
+        int lit_pixels = 0;
         for (int scan_x = 0; scan_x < SCREEN_WIDTH; scan_x++) {
             if (display_get_pixel_from_buffer(display_buffer, scan_x, scan_y)) {
-                found = true;
-                break;
+                lit_pixels++;
             }
         }
 
-        if (found) {
+        if (lit_pixels > 0 && fallback_bottom_y < 0) {
+            fallback_bottom_y = scan_y;
+        }
+
+        // Ignore single-pixel outliers when choosing the decor baseline.
+        if (lit_pixels >= 2) {
             bottom_y = scan_y;
             break;
         }
+    }
+
+    if (bottom_y < 0) {
+        bottom_y = fallback_bottom_y;
     }
 
     memset(decor_mask_buffer, 0, sizeof(decor_mask_buffer));
@@ -1413,6 +1462,183 @@ static void display_draw_sunken_ship_wheel(int x, int y)
     display_draw_line(x + 1, y + 8, x + 1, y + 10);
 }
 
+static void display_draw_day_sun_rays(void)
+{
+    if (!aquarium_should_show_sun_rays()) {
+        sun_ray_origin_x = -1;
+        sun_ray_beam_count = 0;
+        return;
+    }
+
+    TickType_t now = xTaskGetTickCount();
+    if (sun_ray_origin_x < 0) {
+        sun_ray_origin_x = (int)(esp_random() % SCREEN_WIDTH);
+        sun_ray_beam_count = 1 + (int)(esp_random() % 3);
+    }
+
+    int sway = (int)((now / pdMS_TO_TICKS(1400)) % 3) - 1;
+    int top_x0 = clamp_int(sun_ray_origin_x - 3 + sway, 0, SCREEN_WIDTH - 1);
+    int top_x1 = clamp_int(sun_ray_origin_x + sway, 0, SCREEN_WIDTH - 1);
+    int top_x2 = clamp_int(sun_ray_origin_x + 3 + sway, 0, SCREEN_WIDTH - 1);
+
+    int bottom_x0 = clamp_int(top_x0 + 16, 0, SCREEN_WIDTH - 1);
+    int bottom_x1 = clamp_int(top_x1 + 17, 0, SCREEN_WIDTH - 1);
+    int bottom_x2 = clamp_int(top_x2 + 18, 0, SCREEN_WIDTH - 1);
+
+    // Long diagonal beams that start at the top and land on the sand line.
+    // Keep the number sparse so the tank doesn't get flooded with light.
+    if (sun_ray_beam_count >= 1) {
+        display_draw_dotted_line(top_x0, 0, bottom_x0, SCREEN_HEIGHT - 1);
+    }
+    if (sun_ray_beam_count >= 2) {
+        display_draw_dotted_line(top_x1, 0, bottom_x1, SCREEN_HEIGHT - 1);
+    }
+    if (sun_ray_beam_count >= 3) {
+        display_draw_dotted_line(top_x2, 0, bottom_x2, SCREEN_HEIGHT - 1);
+    }
+}
+
+static void display_draw_dotted_line(int x1, int y1, int x2, int y2)
+{
+    int dx = abs(x2 - x1);
+    int dy = abs(y2 - y1);
+    int sx = (x1 < x2) ? 1 : -1;
+    int sy = (y1 < y2) ? 1 : -1;
+    int error = dx - dy;
+    int step = 0;
+
+    while (true) {
+        if ((step % 3) != 1) {
+            display_set_pixel(x1, y1, true);
+        }
+        if (x1 == x2 && y1 == y2) {
+            break;
+        }
+
+        int error2 = 2 * error;
+        if (error2 > -dy) {
+            error -= dy;
+            x1 += sx;
+        }
+        if (error2 < dx) {
+            error += dx;
+            y1 += sy;
+        }
+        step++;
+    }
+}
+
+static void display_draw_night_moon(void)
+{
+    if (aquarium_is_daytime()) {
+        return;
+    }
+
+    // Draw a larger crescent moon at (8,7): outer circle (radius 4), inner circle (radius 3, offset right)
+    int cx = 8, cy = 3;
+    int outer_r = 4;
+    int inner_r = 3;
+    for (int dy = -outer_r; dy <= outer_r; dy++) {
+        for (int dx = -outer_r; dx <= outer_r; dx++) {
+            int ox = cx + dx;
+            int oy = cy + dy;
+            if (dx*dx + dy*dy <= outer_r*outer_r) {
+                // Offset the inner circle more to the right for a clean crescent
+                int inner_dx = dx - 2;
+                int inner_dy = dy;
+                // Only draw if outside the inner circle (to make a crescent)
+                if (inner_dx*inner_dx + inner_dy*inner_dy >= inner_r*inner_r) {
+                    // Remove stray dot by not drawing the rightmost column
+                    if (dx < outer_r) {
+                        display_set_pixel(ox, oy, true);
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void display_draw_rain_surface(void)
+{
+    int frame = game_state.time_elapsed;
+    const int ripple_y = WATER_TOP - 1;
+
+    if (!aquarium_is_raining()) {
+        for (int i = 0; i < (int)(sizeof(rain_drops) / sizeof(rain_drops[0])); i++) {
+            rain_drops[i].active = false;
+        }
+        last_rain_frame = frame;
+        return;
+    }
+
+    if (last_rain_frame != frame) {
+        last_rain_frame = frame;
+
+        int spawn_chance = 38;
+        for (int i = 0; i < (int)(sizeof(rain_drops) / sizeof(rain_drops[0])); i++) {
+            rain_drop_t *drop = &rain_drops[i];
+
+            if (!drop->active) {
+                if ((esp_random() % 100) < spawn_chance) {
+                    drop->active = true;
+                    drop->state = 0;
+                    drop->age = 0;
+                    drop->x = 2 + (esp_random() % (SCREEN_WIDTH - 4));
+                    drop->y = esp_random() % 2;
+                    drop->speed = 1 + (esp_random() % 2);
+                }
+                continue;
+            }
+
+            if (drop->state == 0) {
+                drop->y += drop->speed;
+                if (drop->y >= ripple_y - 1) {
+                    drop->y = ripple_y;
+                    drop->state = 1;
+                    drop->age = 0;
+                }
+            } else {
+                drop->age++;
+                if (drop->age > 3) {
+                    drop->active = false;
+                }
+            }
+        }
+    }
+
+    for (int i = 0; i < (int)(sizeof(rain_drops) / sizeof(rain_drops[0])); i++) {
+        const rain_drop_t *drop = &rain_drops[i];
+        if (!drop->active) {
+            continue;
+        }
+
+        if (drop->state == 0) {
+            display_set_pixel(drop->x, drop->y, true);
+            if (drop->y > 0 && ((drop->x + frame) & 1) == 0) {
+                display_set_pixel(drop->x, drop->y - 1, true);
+            }
+            continue;
+        }
+
+        if (drop->age == 0) {
+            display_set_pixel(drop->x, ripple_y, true);
+        } else if (drop->age == 1) {
+            display_set_pixel(drop->x - 1, ripple_y, true);
+            display_set_pixel(drop->x + 1, ripple_y, true);
+        } else if (drop->age == 2) {
+            display_set_pixel(drop->x - 2, ripple_y, true);
+            display_set_pixel(drop->x + 2, ripple_y, true);
+            display_set_pixel(drop->x - 1, ripple_y + 1, true);
+            display_set_pixel(drop->x + 1, ripple_y + 1, true);
+        } else {
+            display_set_pixel(drop->x - 3, ripple_y, true);
+            display_set_pixel(drop->x + 3, ripple_y, true);
+            display_set_pixel(drop->x - 2, ripple_y + 1, true);
+            display_set_pixel(drop->x + 2, ripple_y + 1, true);
+        }
+    }
+}
+
 static void display_draw_mini_lighthouse(int x, int y)
 {
     // Tower base - wider and taller, clearly tapering
@@ -1827,6 +2053,10 @@ void display_draw_aquarium_screen(int currency, const char *status, bool show_cl
         display_set_pixel(x, bottom_line_y, true);
     }
 
+    display_draw_day_sun_rays();
+    display_draw_night_moon();
+    display_draw_rain_surface();
+
     if (show_clock_mode) {
         const char *text = (clock_text != NULL && clock_text[0] != '\0') ? clock_text : "--:--";
         const int scale = 4;
@@ -1923,6 +2153,18 @@ void display_draw_aquarium_screen(int currency, const char *status, bool show_cl
             }
             display_draw_circle(food_list[i].x, food_list[i].y, radius, true);
         }
+    }
+
+    for (int i = 0; i < MAX_SLEEP_Z; i++) {
+        if (!sleep_z_list[i].active) {
+            continue;
+        }
+
+        display_draw_tiny_sleep_z(sleep_z_list[i].x, sleep_z_list[i].y);
+    }
+
+    if (aquarium_should_flash_thunder()) {
+        display_invert_rect(0, 0, SCREEN_WIDTH - 1, SCREEN_HEIGHT - 1);
     }
 
     display_render();

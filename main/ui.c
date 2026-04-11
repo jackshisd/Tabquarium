@@ -61,7 +61,7 @@ static const TickType_t prize_overlay_ticks = pdMS_TO_TICKS(2200);
 static const TickType_t tab_overlay_ticks = pdMS_TO_TICKS(1800);
 static const TickType_t idle_sleep_ticks = pdMS_TO_TICKS(30000);
 static const TickType_t wake_input_lockout_ticks = pdMS_TO_TICKS(500);
-static const TickType_t clock_set_toggle_hold_ticks = pdMS_TO_TICKS(3000);
+static const TickType_t clock_set_toggle_hold_ticks = pdMS_TO_TICKS(2000);
 static const TickType_t clock_set_repeat_start_ticks = pdMS_TO_TICKS(1000);
 static const TickType_t clock_set_repeat_ticks = pdMS_TO_TICKS(120);
 static const int tab_reward_amount = 1;
@@ -133,6 +133,8 @@ static void adjust_clock_seconds(int delta_seconds)
 
     tv.tv_sec += delta_seconds;
     settimeofday(&tv, NULL);
+    aquarium_invalidate_weather_seed();
+    aquarium_save_state();
     update_clock_text();
 }
 

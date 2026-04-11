@@ -14,6 +14,7 @@
 #define MAX_DECOR 4
 #define MAX_BUBBLES 12
 #define MAX_SLIME 32
+#define MAX_SLEEP_Z 24
 #define MIN_FISH_SIZE 6
 #define MAX_FISH_SIZE 14
 #define MAX_FISH_CAPACITY NUM_FISH
@@ -124,6 +125,14 @@ typedef struct {
 } slime_t;
 
 typedef struct {
+    int x;
+    int y;
+    int vx;
+    int lifetime_frames;
+    bool active;
+} sleep_z_t;
+
+typedef struct {
     int tabs;
     int time_elapsed;
     int fish_capacity;
@@ -137,11 +146,18 @@ extern food_t food_list[MAX_FOOD];
 extern decor_t decor_list[MAX_DECOR];
 extern bubble_t bubble_list[MAX_BUBBLES];
 extern slime_t slime_list[MAX_SLIME];
+extern sleep_z_t sleep_z_list[MAX_SLEEP_Z];
 
 void aquarium_init(void);
 void aquarium_update(void);
 void aquarium_drop_food(int x, int y);
 void aquarium_feedfish(void);
+bool aquarium_is_daytime(void);
+bool aquarium_is_raining(void);
+bool aquarium_is_thunderstorm(void);
+bool aquarium_should_flash_thunder(void);
+bool aquarium_should_show_sun_rays(void);
+void aquarium_invalidate_weather_seed(void);
 bool aquarium_add_fish(void);
 bool aquarium_add_fish_with_size(int length_tenths);
 bool aquarium_add_fish_with_species(uint16_t species_index, int length_tenths);
