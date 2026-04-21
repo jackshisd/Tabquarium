@@ -25,6 +25,7 @@ static const char *NVS_KEY_LAST_UNIX = "last_unix";
 static const char *NVS_KEY_TANK_HUNGER = "tank_hunger";
 static const char *NVS_KEY_SAVE_VERSION = "save_version";
 static const char *NVS_KEY_WEATHER_SEED = "weather_seed";
+static const char *NVS_KEY_REWARD_COUNT = "reward_count";
 static const int save_schema_version_current = 2;
 
 // Dev toggle: set false for normal persistent gameplay.
@@ -32,7 +33,7 @@ static const bool dev_wipe_on_boot = false;
 static const bool dev_spawn_snail_and_crab = false;
 static const bool dev_spawn_showcase_fish = false;
 static const bool always_raining = false;
-static const bool always_thunder = true;
+static const bool always_thunder = false;
 
 static const int default_fish_capacity = MAX_FISH_CAPACITY;
 static const int default_tabs = 100;
@@ -119,6 +120,7 @@ static int pending_offline_death_count = 0;
 static bool startup_overlay_pending = false;
 static char startup_overlay_message[32];
 static TickType_t led_flash_until_tick = 0;
+static int32_t reward_count = 0;
 static int sleep_z_spawn_cooldown_by_fish[NUM_FISH];
 static int feeding_target_food_by_fish[NUM_FISH];
 static int feeding_target_rank_by_fish[NUM_FISH];
@@ -519,18 +521,21 @@ bool aquarium_should_flash_thunder(void)
     TickType_t now_tick = xTaskGetTickCount();
     int ms_in_second = (int)((now_tick * portTICK_PERIOD_MS) % 1000);
 
-    for (int strike = 0; strike < 3; strike++) {
+    for (int strike = 0; strike < 10; strike++) {
         uint32_t seed = thunder_hash_u32((uint32_t)weather_seed.start_unix ^
                                          (uint32_t)(rain_chunk * 131 + minute_in_chunk * 17 + strike * 73));
-        int strike_second = (int)(seed % 20U) + (strike * 20);
+        int strike_second = (int)(seed % 6U) + (strike * 6);
         if (strike_second != second_in_minute) {
             continue;
         }
 
-        int pattern_offset_ms = ms_in_second % 360;
-        if ((pattern_offset_ms < 55) ||
-            (pattern_offset_ms >= 110 && pattern_offset_ms < 150) ||
-            (pattern_offset_ms >= 210 && pattern_offset_ms < 240)) {
+        if (ms_in_second < 140) {
+            return true;
+        }
+        if (ms_in_second >= 260 && ms_in_second < 360) {
+            return true;
+        }
+        if (ms_in_second >= 520 && ms_in_second < 600) {
             return true;
         }
     }
@@ -551,6 +556,46 @@ bool aquarium_should_show_sun_rays(void)
     }
 
     return weather_chunks_active(now_unix, weather_seed.sun_chunk_count, weather_seed.sun_start_seconds, weather_seed.sun_duration_seconds);
+}
+
+bool aquarium_should_force_shark_reward(void)
+{
+    return reward_count == 29;
+}
+
+void aquarium_mark_reward_opened(void)
+{
+    reward_count++;
+}
+
+bool aquarium_is_dev_wipe_on_boot_enabled(void)
+{
+    return dev_wipe_on_boot;
+}
+
+bool aquarium_is_dev_spawn_snail_and_crab_enabled(void)
+{
+    return dev_spawn_snail_and_crab;
+}
+
+bool aquarium_is_dev_spawn_showcase_fish_enabled(void)
+{
+    return dev_spawn_showcase_fish;
+}
+
+bool aquarium_is_always_raining_test_mode(void)
+{
+    return always_raining;
+}
+
+bool aquarium_is_thunder_test_mode(void)
+{
+    return always_thunder;
+}
+
+bool aquarium_is_decor_preview_test_mode(void)
+{
+    return DECOR_PREVIEW_TEST_BUILD != 0;
 }
 
 void aquarium_invalidate_weather_seed(void)
@@ -1179,6 +1224,7 @@ static void load_default_state(void)
     game_state.next_name_index = 0;
     game_state.gameover = false;
     tank_hunger_seconds = hunger_full_seconds;
+    reward_count = 0;
 
     clear_world();
 
@@ -1208,6 +1254,7 @@ static void load_dev_wiped_state(void)
     game_state.next_name_index = 0;
     game_state.gameover = false;
     tank_hunger_seconds = hunger_full_seconds;
+    reward_count = 0;
 
     clear_world();
 }
@@ -1317,6 +1364,7 @@ void aquarium_load_state(void)
     int64_t last_unix = 0;
     int32_t stored_tank_hunger = hunger_full_seconds;
     int32_t stored_save_version = 0;
+    int32_t stored_reward_count = 0;
     weather_seed_t stored_weather_seed = {0};
     esp_err_t err_state = nvs_get_blob(handle, NVS_KEY_STATE, &game_state, &state_size);
     esp_err_t err_fish = nvs_get_blob(handle, NVS_KEY_FISH, fish_tank, &fish_size);
@@ -1325,6 +1373,7 @@ void aquarium_load_state(void)
     esp_err_t err_last_unix = nvs_get_i64(handle, NVS_KEY_LAST_UNIX, &last_unix);
     esp_err_t err_tank_hunger = nvs_get_i32(handle, NVS_KEY_TANK_HUNGER, &stored_tank_hunger);
     esp_err_t err_save_version = nvs_get_i32(handle, NVS_KEY_SAVE_VERSION, &stored_save_version);
+    esp_err_t err_reward_count = nvs_get_i32(handle, NVS_KEY_REWARD_COUNT, &stored_reward_count);
     size_t weather_seed_size = sizeof(stored_weather_seed);
     esp_err_t err_weather_seed = nvs_get_blob(handle, NVS_KEY_WEATHER_SEED, &stored_weather_seed, &weather_seed_size);
     nvs_close(handle);
@@ -1352,6 +1401,7 @@ void aquarium_load_state(void)
     } else {
         memset(&weather_seed, 0, sizeof(weather_seed));
     }
+    reward_count = (err_reward_count == ESP_OK && stored_reward_count >= 0) ? stored_reward_count : 0;
 
     clamp_state_values();
 
@@ -1440,6 +1490,7 @@ void aquarium_save_state(void)
     nvs_set_blob(handle, NVS_KEY_DECOR_OWNED, decor_owned, sizeof(decor_owned));
     nvs_set_i32(handle, NVS_KEY_TANK_HUNGER, tank_hunger_seconds);
     nvs_set_i32(handle, NVS_KEY_SAVE_VERSION, save_schema_version_current);
+    nvs_set_i32(handle, NVS_KEY_REWARD_COUNT, reward_count);
     nvs_set_blob(handle, NVS_KEY_WEATHER_SEED, &weather_seed, sizeof(weather_seed));
 
     int64_t now_unix = get_unix_time_seconds();

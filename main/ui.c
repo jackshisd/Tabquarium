@@ -40,7 +40,12 @@ typedef struct {
 void display_init(void);
 void display_power_off(void);
 void display_power_on(void);
-void display_draw_aquarium_screen(int tabs, const char *status, bool show_clock_mode, const char *clock_text, int mode_badge);
+void display_draw_aquarium_screen(int tabs,
+                                  const char *status,
+                                  bool show_clock_mode,
+                                  const char *clock_text,
+                                  int mode_badge,
+                                  const char *center_message);
 void display_draw_blindbox_screen(int tabs, bool shaking, int shake_speed, const char *prize_name, const char *prize_desc, bool show_prize, bool show_tab_reward);
 void display_draw_fish_screen(int scroll_offset, bool show_sell_prompt, int sell_price, bool sell_confirm_pending);
 void display_draw_decorations_screen(int scroll_offset);
@@ -52,6 +57,7 @@ bool input_tabs_button_down(void);
 gpio_num_t input_mode_button_gpio(void);
 gpio_num_t input_action_button_gpio(void);
 gpio_num_t input_tabs_button_gpio(void);
+gpio_num_t input_tabs_button_aux_gpio(void);
 bool aquarium_consume_startup_overlay(char *out_message, size_t out_message_size);
 void aquarium_flash_led_for_ms(uint32_t duration_ms);
 
@@ -64,6 +70,7 @@ static const TickType_t wake_input_lockout_ticks = pdMS_TO_TICKS(500);
 static const TickType_t clock_set_toggle_hold_ticks = pdMS_TO_TICKS(2000);
 static const TickType_t clock_set_repeat_start_ticks = pdMS_TO_TICKS(1000);
 static const TickType_t clock_set_repeat_ticks = pdMS_TO_TICKS(120);
+static const TickType_t girlfriend_message_ticks = pdMS_TO_TICKS(2500);
 static const int tab_reward_amount = 1;
 
 static screen_t current_screen = SCREEN_BLINDBOX;
@@ -97,8 +104,46 @@ static bool tabs_button_prev_down = false;
 static TickType_t clock_set_combo_start_tick = 0;
 static bool clock_set_combo_latched = false;
 static screen_t clock_set_return_screen = SCREEN_AQUARIUM;
+static char girlfriend_message_text[48] = "";
+static TickType_t girlfriend_message_until_tick = 0;
+
+static const char *girlfriend_messages[] = {
+    "I LOVE YOU",
+    "YOU'RE THE BEST",
+    "LET'S CUDDLE",
+    "YOU'RE MY FAVORITE",
+    "YOU MAKE ME SMILE",
+    "YOU'RE AMAZING",
+    "YOU'RE SO SWEET",
+    "YOU'RE BEAUTIFUL",
+    "YOU MEAN SO MUCH",
+    "YOU'RE MY SUNSHINE",
+    "YOU LIGHT UP MY DAY",
+    "HI SANTSI",
+    "YOU ARE ADORABLE",
+    "YOU'RE WONDERFUL",
+    "YOU'RE MY PERSON",
+    "YOU'RE THE CUTEST",
+    "YOU MAKE LIFE BETTER",
+    "YOU ARE SO SPECIAL",
+    "YOU'RE A GEM",
+    "GN, JK GOODNIGHT!",
+    "ILY, JK I LOVE YOU!",
+    "YOU'RE SO LOVELY",
+    "GET SLIMED!",
+    "LISTEN TO ME YAP",
+    "YOU'RE INCREDIBLE",
+    "YOU MAKE EVERYTHING BETTER",
+    "YOU'RE THE SWEETEST",
+    "I'LL KILL SPIDERS FOR YOU",
+    "YOU'RE SO PRECIOUS",
+    "I ADORE YOU",
+};
 
 static void set_status(const char *message);
+
+static void show_random_girlfriend_message(void);
+static const char *get_active_center_message(void);
 
 static bool aquarium_sleep_prevented(void)
 {
@@ -165,6 +210,34 @@ static void start_input_lockout(TickType_t now)
 {
     input_lockout_until_tick = now + wake_input_lockout_ticks;
     reset_button_states();
+}
+
+static void show_random_girlfriend_message(void)
+{
+    size_t message_count = sizeof(girlfriend_messages) / sizeof(girlfriend_messages[0]);
+    if (message_count == 0) {
+        return;
+    }
+
+    const char *message = girlfriend_messages[rand() % message_count];
+    snprintf(girlfriend_message_text, sizeof(girlfriend_message_text), "%s", message);
+    girlfriend_message_until_tick = xTaskGetTickCount() + girlfriend_message_ticks;
+}
+
+static const char *get_active_center_message(void)
+{
+    if (girlfriend_message_until_tick == 0) {
+        return NULL;
+    }
+
+    TickType_t now = xTaskGetTickCount();
+    if (now >= girlfriend_message_until_tick) {
+        girlfriend_message_until_tick = 0;
+        girlfriend_message_text[0] = '\0';
+        return NULL;
+    }
+
+    return girlfriend_message_text;
 }
 
 static void handle_clock_set_adjust_button(button_state_t *button, bool down, TickType_t now, bool adjust_hours)
@@ -303,10 +376,14 @@ static void enter_idle_sleep_if_needed(TickType_t now)
     gpio_num_t mode_gpio = input_mode_button_gpio();
     gpio_num_t action_gpio = input_action_button_gpio();
     gpio_num_t tabs_gpio = input_tabs_button_gpio();
+    gpio_num_t tabs_aux_gpio = input_tabs_button_aux_gpio();
 
     gpio_wakeup_disable(mode_gpio);
     gpio_wakeup_disable(action_gpio);
     gpio_wakeup_disable(tabs_gpio);
+    if (tabs_aux_gpio != GPIO_NUM_NC) {
+        gpio_wakeup_disable(tabs_aux_gpio);
+    }
     gpio_wakeup_enable(mode_gpio, GPIO_INTR_LOW_LEVEL);
     gpio_wakeup_enable(action_gpio, GPIO_INTR_LOW_LEVEL);
     esp_sleep_enable_gpio_wakeup();
@@ -722,6 +799,8 @@ static void handle_tabs_button(bool down)
             aquarium_flash_led_for_ms(2000);
             trigger_tab_overlay();
             set_status("TAB +1");
+        } else if (current_screen == SCREEN_AQUARIUM) {
+            show_random_girlfriend_message();
         }
         return;
     }
@@ -839,6 +918,7 @@ static void handle_action_button(bool down)
                 blindbox_shaking = false;
                 game_state.tabs -= 3;
                 apply_gift(&gift);
+                aquarium_mark_reward_opened();
                 aquarium_save_state();
             }
         } else if (current_screen == SCREEN_AQUARIUM) {
@@ -980,7 +1060,13 @@ static void render_current_screen(void)
             update_clock_text();
         }
 
-        display_draw_aquarium_screen(game_state.tabs, status, show_clock_mode, aquarium_clock_text, mode_badge);
+        display_draw_aquarium_screen(
+            game_state.tabs,
+            status,
+            show_clock_mode,
+            aquarium_clock_text,
+            mode_badge,
+            get_active_center_message());
     } else if (current_screen == SCREEN_FISH) {
         display_draw_fish_screen(fish_scroll_offset, fish_sell_prompt_visible, fish_sell_price_tabs, fish_sell_confirm_ready);
     } else if (current_screen == SCREEN_CLOCK_SET) {

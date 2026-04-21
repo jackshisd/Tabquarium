@@ -17,8 +17,8 @@ static const char *TAG = "DISPLAY";
 #define SSD1306_I2C_PORT I2C_NUM_0
 
 #if CONFIG_IDF_TARGET_ESP32C3
-#define SSD1306_SDA_GPIO GPIO_NUM_5
-#define SSD1306_SCL_GPIO GPIO_NUM_6
+#define SSD1306_SDA_GPIO GPIO_NUM_6
+#define SSD1306_SCL_GPIO GPIO_NUM_7
 #else
 #define SSD1306_SDA_GPIO GPIO_NUM_22
 #define SSD1306_SCL_GPIO GPIO_NUM_23
@@ -190,6 +190,7 @@ static int font_index(char c)
 static void display_set_pixel(int x, int y, bool on);
 static void display_draw_decoration(decor_kind_t kind, int x, int y);
 static void display_draw_dotted_line(int x1, int y1, int x2, int y2);
+static void display_draw_dev_test_overlays(void);
 
 static void display_draw_text(int x, int y, const char *text)
 {
@@ -266,6 +267,51 @@ static void display_draw_tiny_sleep_z(int x, int y)
     display_set_pixel(x, y + 3, true);
     display_set_pixel(x + 1, y + 3, true);
     display_set_pixel(x + 2, y + 3, true);
+}
+
+static void display_draw_dev_test_overlays(void)
+{
+    const char *labels[6];
+    int label_count = 0;
+
+    if (aquarium_is_dev_wipe_on_boot_enabled()) {
+        labels[label_count++] = "WIPE TEST";
+    }
+    if (aquarium_is_dev_spawn_snail_and_crab_enabled()) {
+        labels[label_count++] = "SNAIL+CRAB TEST";
+    }
+    if (aquarium_is_dev_spawn_showcase_fish_enabled()) {
+        labels[label_count++] = "SHOWCASE TEST";
+    }
+    if (aquarium_is_always_raining_test_mode()) {
+        labels[label_count++] = "RAIN TEST";
+    }
+    if (aquarium_is_thunder_test_mode()) {
+        labels[label_count++] = "THUNDER TEST";
+    }
+    if (aquarium_is_decor_preview_test_mode()) {
+        labels[label_count++] = "DECOR PREVIEW";
+    }
+
+    if (label_count == 0) {
+        return;
+    }
+
+    int block_height = ((label_count - 1) * 8) + 7;
+    int start_y = (SCREEN_HEIGHT - block_height) / 2;
+    if (start_y < 0) {
+        start_y = 0;
+    }
+
+    for (int i = 0; i < label_count; i++) {
+        int text_w = ((int)strlen(labels[i]) * 6) - 1;
+        int text_x = (SCREEN_WIDTH - text_w) / 2;
+        int text_y = start_y + (i * 8);
+        if (text_x < 0) {
+            text_x = 0;
+        }
+        display_draw_text(text_x, text_y, labels[i]);
+    }
 }
 
 static void display_draw_number(int x, int y, int value)
@@ -359,7 +405,40 @@ static void display_draw_decoration_bottom_aligned(decor_kind_t kind, int x, int
         }
     }
 
+    int min_x = SCREEN_WIDTH;
+    int min_y = SCREEN_HEIGHT;
+    int max_x = -1;
+    int max_y = -1;
+    for (int scan_y = 0; scan_y < SCREEN_HEIGHT; scan_y++) {
+        for (int scan_x = 0; scan_x < SCREEN_WIDTH; scan_x++) {
+            if (!display_get_pixel_from_buffer(decor_mask_buffer, scan_x, scan_y)) {
+                continue;
+            }
+
+            if (scan_x < min_x) {
+                min_x = scan_x;
+            }
+            if (scan_x > max_x) {
+                max_x = scan_x;
+            }
+            if (scan_y < min_y) {
+                min_y = scan_y;
+            }
+            if (scan_y > max_y) {
+                max_y = scan_y;
+            }
+        }
+    }
+
     memcpy(display_buffer, decor_base_buffer, sizeof(display_buffer));
+    if (max_x >= min_x && max_y >= min_y) {
+        for (int scan_y = min_y; scan_y <= max_y; scan_y++) {
+            for (int scan_x = min_x; scan_x <= max_x; scan_x++) {
+                display_set_pixel(scan_x, scan_y, false);
+            }
+        }
+    }
+
     for (int scan_y = 0; scan_y < SCREEN_HEIGHT; scan_y++) {
         for (int scan_x = 0; scan_x < SCREEN_WIDTH; scan_x++) {
             if (display_get_pixel_from_buffer(decor_mask_buffer, scan_x, scan_y)) {
@@ -1534,8 +1613,8 @@ static void display_draw_night_moon(void)
         return;
     }
 
-    // Draw a larger crescent moon at (8,7): outer circle (radius 4), inner circle (radius 3, offset right)
-    int cx = 8, cy = 3;
+    // Draw a crescent moon tucked into the top-left corner with a small margin.
+    int cx = 5, cy = 4;
     int outer_r = 4;
     int inner_r = 3;
     for (int dy = -outer_r; dy <= outer_r; dy++) {
@@ -2040,7 +2119,12 @@ void display_init(void)
     display_render();
 }
 
-void display_draw_aquarium_screen(int currency, const char *status, bool show_clock_mode, const char *clock_text, int mode_badge)
+void display_draw_aquarium_screen(int currency,
+                                  const char *status,
+                                  bool show_clock_mode,
+                                  const char *clock_text,
+                                  int mode_badge,
+                                  const char *center_message)
 {
     (void)currency;
     (void)status;
@@ -2162,6 +2246,18 @@ void display_draw_aquarium_screen(int currency, const char *status, bool show_cl
 
         display_draw_tiny_sleep_z(sleep_z_list[i].x, sleep_z_list[i].y);
     }
+
+    if (!show_clock_mode && center_message != NULL && center_message[0] != '\0') {
+        int text_w = ((int)strlen(center_message) * 6) - 1;
+        int text_x = (SCREEN_WIDTH - text_w) / 2;
+        int text_y = (SCREEN_HEIGHT / 2) - 3;
+        if (text_x < 0) {
+            text_x = 0;
+        }
+        display_draw_text(text_x, text_y, center_message);
+    }
+
+    display_draw_dev_test_overlays();
 
     if (aquarium_should_flash_thunder()) {
         display_invert_rect(0, 0, SCREEN_WIDTH - 1, SCREEN_HEIGHT - 1);
